@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"sync"
 
 	"github.com/gocraft/dbr/v2"
 	"github.com/gocraft/dbr/v2/dialect"
@@ -25,6 +26,7 @@ type Machine interface {
 
 	// Check if a type's object is in a proper state to handle event.
 	Can(id int, event Event) (bool, error)
+	ToState(fromState int, event Event) (int, error)
 	Fire(id int, event Event) error
 }
 
@@ -122,6 +124,52 @@ func (s *SqlType) Get(id int) (int, error) {
 	return id, err
 }
 
+type MapType struct {
+	data map[int]int
+	m    sync.RWMutex
+}
+
+func NewMapType() *MapType {
+	return &MapType{
+		make(map[int]int), sync.RWMutex{},
+	}
+}
+
+func (m *MapType) Add(id, state int) error {
+	m.m.Lock()
+	defer m.m.Unlock()
+
+	if _, ok := m.data[id]; ok {
+		return ErrDuplicate
+	}
+	m.data[id] = state
+	return nil
+}
+
+func (m *MapType) Get(id int) (int, error) {
+	m.m.RLock()
+	defer m.m.RUnlock()
+	state, ok := m.data[id]
+	if !ok {
+		return 0, ErrCannotFindInstance
+	}
+	return state, nil
+}
+
+func (m *MapType) Transition(id, fromState, toState int) error {
+	m.m.Lock()
+	defer m.m.Unlock()
+	state, ok := m.data[id]
+	if !ok {
+		return ErrCannotFindInstance
+	}
+	if state != fromState {
+		return ErrCannotFindTransition
+	}
+	m.data[id] = toState
+	return nil
+}
+
 func (s *SqlType) Transition(id, fromState, toState int) error {
 	err := s.db.QueryRow(s.updateQ, toState, id, fromState).Scan(&id)
 	if err == sql.ErrNoRows {
@@ -156,6 +204,7 @@ func (m machine) Name() string {
 }
 
 var (
+	ErrDuplicate            = errors.New("duplicate object")
 	ErrCannotFindInstance   = errors.New("cannot find object")
 	ErrCannotFindTransition = errors.New("cannot find transition")
 	ErrCannotIdentifyEvent  = errors.New("cannot identify event")
@@ -173,11 +222,14 @@ func (m machine) Can(id int, event Event) (bool, error) {
 		return false, err
 	}
 	_, err = m.ToState(stateID, event)
+	if err == ErrCannotFindTransition {
+		return false, nil
+	}
 	return err == nil, err
 }
 
 func (m machine) ToState(fromState int, event Event) (int, error) {
-	q := m.db.Select("end_state_id").
+	q := m.db.Select("to_state_id").
 		From("state_machine_transition").
 		Where(dbr.Eq("from_state_id", fromState),
 			dbr.Eq("state_machine_id", m.id))
@@ -221,7 +273,7 @@ func (m machine) Fire(id int, event Event) error {
 
 func NewMachine(rawDB *sql.DB, t Type) Machine {
 	db := &dbr.Connection{
-		DB:            nil,
+		DB:            rawDB,
 		Dialect:       dialect.PostgreSQL,
 		EventReceiver: &dbr.NullEventReceiver{},
 	}
